@@ -58,6 +58,10 @@ dkms.conf
 [Dd]ebug
 *.launch
 
+#KiCad
+fp-info-cache
+*-backups/
+
 #Test code
 misc_test/
 
