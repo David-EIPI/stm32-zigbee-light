@@ -1,10 +1,18 @@
-/*
- * controls.h
- *
- *  Created on: Aug 31, 2024
- *      Author: shir
- */
-
+/**
+  ******************************************************************************
+  * @file           : controls.h
+  * @author         : David Shirvanyants
+  * @date           : Aug 31, 2024
+  * @brief          : Hardware interface header file.
+  ******************************************************************************
+  * @attention
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
 #ifndef CONTROLS_H_
 #define CONTROLS_H_
 

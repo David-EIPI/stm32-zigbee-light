@@ -1,3 +1,18 @@
+/**
+  ******************************************************************************
+  * @file           : multistate.c
+  * @author         : David Shirvanyants
+  * @date           : Sep 11, 2024
+  * @brief          : Implements basic Multistate{Input,Output,Value} clusters.
+  ******************************************************************************
+  * @attention
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
 #include "../basic/multistate.h"
 
 #include "app_common.h"

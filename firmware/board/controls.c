@@ -1,10 +1,18 @@
-/*
- * controls.c
- *
- *  Created on: Aug 31, 2024
- *      Author: shir
- */
-
+/**
+  ******************************************************************************
+  * @file           : controls.c
+  * @author         : David Shirvanyants
+  * @date           : Aug 31, 2024
+  * @brief          : Hardware interface data, functions and drivers.
+  ******************************************************************************
+  * @attention
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
 #include <math.h>
 
 #include "controls.h"
@@ -62,6 +70,13 @@ static uint32_t sw2_states[lengthof(switch1_gpio_pin)] = { 0 };
 volatile uint16_t adcdmavals[4] = {0};
 
 static int adc_updated = 1;
+
+enum {
+	ADC_SLOT_LDR = 0,
+	ADC_SLOT_POT = 1,
+	ADC_SLOT_TEMP = 2,
+	ADC_SLOT_VREF = 3,
+};
 
 /*
  * @var Motion sensor data register
@@ -228,10 +243,10 @@ static int32_t ambientSensor = 0;
 
 static void read_temperature(void)
 {
-	int vref = (V_REF_INT * 4095) / adcdmavals[3];
+	int vref = (V_REF_INT * 4095) / adcdmavals[ADC_SLOT_VREF];
 //	int vsense = (vref * adcdmavals[2]) / 4095;
 //	int tC = ((V_AT_25C - vsense) * 1000) / (AVG_SLOPE/10) + 250;
-	int tC = 100* __LL_ADC_CALC_TEMPERATURE(vref, adcdmavals[2], LL_ADC_RESOLUTION_12B);
+	int tC = 100* __LL_ADC_CALC_TEMPERATURE(vref, adcdmavals[ADC_SLOT_TEMP], LL_ADC_RESOLUTION_12B);
 	controls.adc_temp = tC;
 }
 
@@ -240,7 +255,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 /* Read the ambient brightness */
 /* Bring the raw value to range */
 	int adc_range = (1 + __HAL_ADC_DIGITAL_SCALE(ADC_GET_RESOLUTION(hadc)));
-	int adc_val = adcdmavals[0];
+	int adc_val = adcdmavals[ADC_SLOT_LDR];
 
 	if (adc_val >= adc_range)
 		adc_val = adc_range-1;
@@ -280,8 +295,8 @@ I = (12000 ** (1/0.75) * 10 lux) / (R ** (1/0.75))
   controls.log2illum = illum;
   /* Read the motion sensitivity setting potentiometer */
 /* Bring the raw value to range */
-	controls.dbg = adcdmavals[1];
-	adc_val = (adcdmavals[1] * (MSENSITIVITY_RANGE-1) + adc_range / 2) / adc_range;
+	controls.dbg = adcdmavals[ADC_SLOT_POT];
+	adc_val = (adcdmavals[ADC_SLOT_POT] * (MSENSITIVITY_RANGE-1) + adc_range / 2) / adc_range;
 	controls.sensitivity = adc_val;
 
 	read_temperature();
