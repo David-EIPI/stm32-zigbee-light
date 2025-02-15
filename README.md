@@ -14,6 +14,8 @@ The firmware implements 6 endpoints and 12 clusters:
 - 1 Illuminance Measurement cluster
 - 1 Temperature Measurement cluster
 
+Zero crossing detection using STM32 timers is described in a [separate file](zerocrossing.md).
+
 ## Hardware
 The replacement PCB board copies the shape of the original control board and fits in the same enclosure without modifications.
 
