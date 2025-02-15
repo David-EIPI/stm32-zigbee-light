@@ -130,7 +130,7 @@ int32_t phase_correction = 0;
 /* The triac on Model1 PCB only works with trailing edge control mode.
  * When using other control circuits trailing_edge can be set to 0 to use leading edge mode.
  *  */
-uint8_t trailing_edge = 1;
+uint8_t trailing_edge = USE_TRAILING_EDGE;
 
 /* USER CODE END PV */
 
@@ -290,14 +290,14 @@ void check_and_update_light_level(void)
 /* Check the ambient light level to detect the dusk and the dawn */
 static void detect_dusk_transition(void)
 {
-/* Detect transitions only the light is off or at least 1 min after it was on to have the sensor settled */
+/* Detect transitions only when the light is off and at least 1 min after it was on to have the sensor settled */
 	if (lightLevel > 0 || timeSeconds - abs(lightOnTime) < 60)
 		return;
 
 	/* Dark to light transition: detect dawn */
 	if ((duskTime > 0)
 			&& ((int)controls.log2illum > ambientThreshold)
-			/*&& (controls.log2illum > duskTransition)*/) {
+			) {
 		dawnTransition = prevIllum;
 		duskTime = 0;
 	}
@@ -305,7 +305,7 @@ static void detect_dusk_transition(void)
 	/* Light to dark transition: detect dusk */
 	if ((duskTime == 0)
 			&& ((int)controls.log2illum < ambientThreshold)
-			/*&& (controls.log2illum < dawnTransition)*/) {
+			) {
 		duskTransition = prevIllum;
 		duskTime = timeSeconds;
 	}
@@ -351,7 +351,7 @@ void seq_zb_leave(void)
 {
 }
 
-#if 0
+#if CFG_DEBUG_TRACE
 /* Debugging routine to direct the log output to the USB */
 int _write(int file, char *ptr, int len) {
     static uint8_t rc = USBD_OK;

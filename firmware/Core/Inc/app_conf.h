@@ -314,6 +314,8 @@ typedef enum
 #define ZIGBEE_DB_START_ADDR                    (0U)
 #define CFG_EE_AUTO_CLEAN                       (1U)
 
+/* TRIACs only work in trailing edge power control mode */
+#define USE_TRAILING_EDGE                        1
 /* USER CODE END Defines */
 
 /******************************************************************************
@@ -334,7 +336,9 @@ typedef enum
   CFG_TASK_VCP_SEND_DATA,
 #endif /* (CFG_USB_INTERFACE_ENABLE != 0) */
   /* USER CODE BEGIN CFG_IdleTask_Id_t */
-
+  CFG_TASK_MAIN_LOOP,
+  CFG_TASK_ZB_LEAVE,
+  CFG_TASK_ZIGBEE_NETWORK_REJOIN,
   /* USER CODE END CFG_IdleTask_Id_t */
   CFG_TASK_NBR  /**< Shall be last in the list */
 } CFG_IdleTask_Id_t;
@@ -371,8 +375,6 @@ typedef enum
   CFG_EVT_SYNCHRO_BYPASS_IDLE,
   CFG_EVT_ZIGBEE_STARTUP_ENDED,
   /* USER CODE BEGIN CFG_IdleEvt_Id_t */
-  CFG_TASK_MAIN_LOOP,
-  CFG_TASK_ZB_LEAVE,
 
   /* USER CODE END CFG_IdleEvt_Id_t */
 } CFG_IdleEvt_Id_t;

@@ -91,14 +91,19 @@
 /* Private macros ------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
-/* Neutralize the auto-generated macro.
- * When active, this flag caps RX in idle state making Zigbee device slow to respond. */
+/* Our device is not configured as a sleepy end device, but CubeIDE still removes RXONDILE from the network setup.
+ * When removed, this flag does not allow RX in idle state making Zigbee device slow to respond.
+ * This macro re-definition neutralizes the auto-generated code and leaves RX always enabled.
+ *
+ * This hack allows to keep the project connected to the IOC file.
+ *  */
 
 #undef MCP_ASSOC_CAP_RXONIDLE
 #define MCP_ASSOC_CAP_RXONIDLE 0
 
 /*
  * Replacing the auto-generated macro with the hack below expands the channel list to all 2.4GHz channels.
+ * As with the MCP_ASSOC_CAP_RXONIDLE, this hack is used to keep connection to the IOC project file.
  *  */
 #undef CHANNEL
 #define CHANNEL  1 ? (((1 << (26-11+1))-1) << 11) : 0
@@ -129,6 +134,10 @@ static void APP_ZIGBEE_ProcessRequestM0ToM4(void);
 
 enum ZclStatusCodeT multistate_presentValue_CB(struct ZbZclClusterT *clusterPtr, struct ZbZclAttrCbInfoT *info);
 enum ZclStatusCodeT analog_presentValue_CB(struct ZbZclClusterT *clusterPtr, struct ZbZclAttrCbInfoT *info, void *arg);
+
+static void APP_ZIGBEE_setup_filter(void);
+static void APP_ZIGBEE_ConfigBasic(void);
+static void APP_ZIGBEE_NwkRejoin(void);
 
 static void APP_ZIGBEE_ConfigBasic(void);
 void set_default_attr_values(void);
@@ -187,9 +196,6 @@ union cache
   uint8_t  U8_data[ST_PERSIST_MAX_ALLOC_SZ];     // in bytes
   uint32_t U32_data[ST_PERSIST_MAX_ALLOC_SZ/4U]; // in U32 words
 };
-// __attribute__ ((section(".noinit"))) union cache cache_persistent_data;
-
-// __attribute__ ((section(".noinit"))) union cache cache_diag_reference;
 
 union cache cache_persistent_data;
 union cache cache_diag_reference;
@@ -233,7 +239,7 @@ struct analog_cluster_attr {
 		{
 				.mode = ANALOG_OUTPUT,
 				.desc = "\x0a" "Dusk level",
-				.value = 80.0,
+				.value = 70.0,
 				.minPresent = 1.0,
 				.maxPresent = 200.0,
 				.step = 1.0,
@@ -278,7 +284,7 @@ struct analog_cluster_attr {
 		{
 				.mode = ANALOG_OUTPUT,
 				.desc = "\x0d" "Phase correct",
-				.value = 0.0,
+				.value = -0.3,
 				.minPresent = -10.0,
 				.maxPresent = 10,
 				.step = 0.001,
@@ -334,6 +340,8 @@ void APP_ZIGBEE_Init(void)
   UTIL_SEQ_RegTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, UTIL_SEQ_RFU, APP_ZIGBEE_NwkForm);
 
   /* USER CODE BEGIN APP_ZIGBEE_INIT */
+  UTIL_SEQ_RegTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, UTIL_SEQ_RFU, APP_ZIGBEE_NwkRejoin);
+
   /* NVM Init */
 #if CFG_NVM
   APP_ZIGBEE_NVM_Init();
@@ -367,11 +375,11 @@ static void APP_ZIGBEE_StackLayersInit(void)
   APP_ZIGBEE_ConfigEndpoints();
 
   /* USER CODE BEGIN APP_ZIGBEE_StackLayersInit */
-  /* Assign default attribute values */
-//  set_default_attr_values();
+  zigbee_app_info.join_status = (enum ZbStatusCodeT) 0x01; /* init to error status */
+  APP_ZIGBEE_setup_filter();
 
   /* STEP 1 - TRY to START FROM PERSISTENCE */
-  enum ZbStatusCodeT status;
+  enum ZbStatusCodeT status = ZbNwkIfSetTxPower(zigbee_app_info.zb, "wpan0", 6) ? 1 : 0;
 
   /* First we disable the persistent notification */
   ZbPersistNotifyRegister(zigbee_app_info.zb,NULL,NULL);
@@ -390,6 +398,7 @@ static void APP_ZIGBEE_StackLayersInit(void)
      zigbee_app_info.join_delay = HAL_GetTick(); /* now */
      zigbee_app_info.startupControl = ZbStartTypeJoin;
      zigbee_app_info.join_status = ZB_STATUS_SUCCESS;
+     ZbZclAttrReportKick(multistate_cluster, true, NULL, NULL);
      return;
   }
   else
@@ -519,11 +528,20 @@ static void APP_ZIGBEE_ConfigEndpoints(void)
   binary_cluster_light_on = ZbZcl_Binary_ServerAlloc(zigbee_app_info.zb, SW1_ENDPOINT, BINARY_SENSOR_INPUT,
 		  &lightState, NULL, NULL);
   assert(binary_cluster_light_on != NULL);
+  ZbZclClusterEndpointRegister(binary_cluster_light_on);
 
   uint8_t light_on_sensor_desc[] = "\x0b" "Light state";
   (void)ZbZclAttrStringWriteShort(binary_cluster_light_on, ZCL_BINARY_DESCRIPTION_ATTR, light_on_sensor_desc);
 
-  ZbZclClusterEndpointRegister(binary_cluster_light_on);
+
+  binary_cluster_dusk_detect = ZbZcl_Binary_ServerAlloc(zigbee_app_info.zb, SW2_ENDPOINT, BINARY_SENSOR_INPUT,
+		  &duskState, NULL, NULL);
+  assert(binary_cluster_dusk_detect != NULL);
+
+  ZbZclClusterEndpointRegister(binary_cluster_dusk_detect);
+
+  uint8_t dusk_detect_sensor_desc[] = "\x0b" "Dusk detect";
+  (void)ZbZclAttrStringWriteShort(binary_cluster_dusk_detect, ZCL_BINARY_DESCRIPTION_ATTR, dusk_detect_sensor_desc);
 
   binary_cluster_motion_detect = ZbZcl_Binary_ServerAlloc(zigbee_app_info.zb, SW3_ENDPOINT, BINARY_SENSOR_INPUT,
 		  &motionState, NULL, NULL);
@@ -534,16 +552,7 @@ static void APP_ZIGBEE_ConfigEndpoints(void)
 
   ZbZclClusterEndpointRegister(binary_cluster_motion_detect);
 
-  binary_cluster_dusk_detect = ZbZcl_Binary_ServerAlloc(zigbee_app_info.zb, SW2_ENDPOINT, BINARY_SENSOR_INPUT,
-		  &duskState, NULL, NULL);
-  assert(binary_cluster_dusk_detect != NULL);
-
-  uint8_t dusk_detect_sensor_desc[] = "\x0b" "Dusk detect";
-  (void)ZbZclAttrStringWriteShort(binary_cluster_dusk_detect, ZCL_BINARY_DESCRIPTION_ATTR, dusk_detect_sensor_desc);
-
-  ZbZclClusterEndpointRegister(binary_cluster_dusk_detect);
-
-#if 0
+#if (!USE_TRAILING_EDGE)
 /* This section is disabled because the current triac control is not compatible with the trailing edge drive mode */
   binary_triac_mode_cluster = ZbZcl_Binary_ServerAlloc(zigbee_app_info.zb, SW1_ENDPOINT, BINARY_SENSOR_OUTPUT,
 		  &trailing_edge, NULL, NULL);
@@ -609,7 +618,7 @@ static void APP_ZIGBEE_NwkForm(void)
       /* Call the callback once here to save persistence data */
       APP_ZIGBEE_persist_notify_cb(zigbee_app_info.zb,NULL);
 
-
+      ZbZclAttrReportKick(multistate_cluster, true, NULL, NULL);
       /* USER CODE END 0 */
     }
     else
@@ -972,6 +981,134 @@ static void APP_ZIGBEE_ProcessRequestM0ToM4(void)
 }
 
 /* USER CODE BEGIN FD_LOCAL_FUNCTIONS */
+
+
+void ZIGBEE_attempt_rejoin(void)
+{
+
+	zigbee_app_info.join_status = (enum ZbStatusCodeT) 0x03; /* init to error status */
+	zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_FAIL_DELAY;
+
+//	UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
+	UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, CFG_SCH_PRIO_0);
+}
+
+/* callback function */
+static enum zb_msg_filter_rc
+app_msg_filter_callback(struct ZigBeeT *zb, uint32_t id, void *msg, void *arg)
+{
+	enum zb_msg_filter_rc res = ZB_MSG_CONTINUE;
+
+	if (0 != (id & (ZB_MSG_FILTER_LEAVE_IND | ZB_MSG_FILTER_STATUS_IND))) {
+
+			if (0 != (id & ZB_MSG_FILTER_LEAVE_IND)) {
+				struct ZbNlmeLeaveIndT *ind = msg;
+/*
+ * If this device was permanently removed from the network, resume searching for an available network.
+ * */
+				if (!ind->rejoin) {
+					zigbee_app_info.join_status = (enum ZbStatusCodeT) 0x04; /* init to error status */
+					zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_FAIL_DELAY;
+					UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
+				}
+			}
+		}
+
+	    if (id == ZB_MSG_FILTER_STATUS_IND) {
+	        struct ZbNlmeNetworkStatusIndT *ind = msg;
+
+	        switch (ind->status) {
+	            case ZB_NWK_STATUS_CODE_PARENT_LINK_FAILURE:
+	                /* Set a flag for application to attempt to rejoin network */
+	                /* Since we will handle this in the application, tell stack
+	                 * to not process this message further by returning ZB_MSG_DISCARD. */
+					APP_DBG("Network Lost / Parent Link Failure");
+					ZIGBEE_attempt_rejoin();
+	                res = ZB_MSG_DISCARD;
+
+	            default:
+	                break;
+	        }
+	    }
+
+		return res;
+}
+
+static struct my_zb_app_data {
+	struct ZbNlmeNetworkStatusIndT status;
+} my_zb_app_data;
+
+static void APP_ZIGBEE_setup_filter(void)
+{
+	/* callback intialization */
+
+	struct ZigBeeT *zb = zigbee_app_info.zb;
+	(void)ZbMsgFilterRegister(zb,
+			ZB_MSG_FILTER_LEAVE_IND | ZB_MSG_FILTER_STATUS_IND,
+			ZB_MSG_DEFAULT_PRIO, app_msg_filter_callback, &my_zb_app_data);
+}
+
+
+struct ZbStartupRejoinWaitInfo {
+  bool active;
+  enum ZbStatusCodeT status;
+};
+
+static void ZbStartupRejoinWaitCb(struct ZbNlmeJoinConfT *conf, void *cb_arg)
+{
+  struct ZbStartupRejoinWaitInfo *info = cb_arg;
+
+  info->status = conf->status;
+  info->active = false;
+  UTIL_SEQ_SetEvt(EVENT_ZIGBEE_STARTUP_ENDED);
+} /* ZbStartupWaitCb */
+
+enum ZbStatusCodeT ZbStartupRejoinWait(struct ZigBeeT *zb)
+{
+  static struct ZbStartupRejoinWaitInfo info;
+  enum ZbStatusCodeT status;
+
+  memset(&info, 0, sizeof(struct ZbStartupRejoinWaitInfo));
+
+  info.active = true;
+  status = ZbStartupRejoin(zb, ZbStartupRejoinWaitCb, &info);
+  if (status != ZB_STATUS_SUCCESS) {
+    info.active = false;
+    return status;
+  }
+  UTIL_SEQ_WaitEvt(EVENT_ZIGBEE_STARTUP_ENDED);
+  status = info.status;
+  return status;
+} /* ZbStartupRejoinWait */
+
+
+static void APP_ZIGBEE_NwkRejoin(void)
+{
+	enum ZbStatusCodeT status;
+	status = ZbStartupRejoinWait(zigbee_app_info.zb);
+	zigbee_app_info.join_status = status;
+
+	if(status != ZB_STATUS_SUCCESS) {
+	/* Handle error. Try to rejoin again later? */
+		APP_DBG("Rejoin failure / Retry in 2 seconds");
+	    zigbee_app_info.join_delay = HAL_GetTick() + 2000;
+	    zigbee_app_info.startupControl = ZbStartTypeJoin;
+
+	    if (status == ZB_NWK_STATUS_INVALID_REQUEST) {
+			UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
+	    } else {
+			UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, CFG_SCH_PRIO_0);
+	    }
+	}
+	else
+	{
+		APP_DBG("Rejoin success");
+	}
+
+	if (zigbee_app_info.join_status != ZB_STATUS_SUCCESS)
+	{
+	}
+}
 
 /**
  * @brief  Setup basic cluster attributes.
