@@ -86,6 +86,8 @@
 #define CFG_NVM                 1U /* use FLASH */
 #define RESET_ZB_NWK            0U
 
+#define APP_ZIGBEE_STARTUP_REJOIN_DELAY               5000U
+
 /* USER CODE END PD */
 
 /* Private macros ------------------------------------------------------------*/
@@ -384,16 +386,40 @@ static void APP_ZIGBEE_StackLayersInit(void)
   /* First we disable the persistent notification */
   ZbPersistNotifyRegister(zigbee_app_info.zb,NULL,NULL);
 
+  /* Increase transmission power (to 3.7dbm). Default setting is 0. */
+  ZbNwkIfSetTxPower(zigbee_app_info.zb, "wpan0", 6);
+  enum ZbStatusCodeT res;
+
+  /* Remove parent link strength threshold. This application does not transmit frequent data
+   * and association happens faster when more nodes are available.  */
+  uint32_t bdb_flags = 0;
+  res = ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
+  if (ZB_STATUS_SUCCESS == res) {
+	  bdb_flags |= ZB_BDB_FLAG_IGNORE_COST_DURING_JOIN;
+	  ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
+  }
+
+
   /* Call a startup from persistence */
 #if CFG_NVM
 #if (RESET_ZB_NWK)
   APP_ZIGBEE_persist_delete();
-#else
+#endif
+#endif
+
   status = APP_ZIGBEE_ZbStartupPersist(zigbee_app_info.zb);
   if(status == ZB_STATUS_SUCCESS)
   {
      /* no fresh startup need anymore */
      APP_DBG("ZbStartupPersist: SUCCESS, restarted from persistence");
+
+     /* Extend default persistence timeouts. Default value of 10s is too frequent and is unnecessary in this application. */
+     uint32_t pers_tm = 0;
+     res = ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, 4, 0);
+     if (ZB_STATUS_SUCCESS == res) {
+   	  pers_tm *= 10;
+   	  ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, sizeof(pers_tm), 0);
+     }
 
      zigbee_app_info.join_delay = HAL_GetTick(); /* now */
      zigbee_app_info.startupControl = ZbStartTypeJoin;
@@ -406,8 +432,6 @@ static void APP_ZIGBEE_StackLayersInit(void)
        /* Start-up form persistence failed perform a fresh ZbStartup */
        APP_DBG("ZbStartupPersist: FAILED to restart from persistence with status: 0x%02x",status);
   }
-#endif
-#endif
   /* USER CODE END APP_ZIGBEE_StackLayersInit */
 
   /* Configure the joining parameters */
@@ -613,12 +637,21 @@ static void APP_ZIGBEE_NwkForm(void)
       APP_DBG("Startup done !\n");
       /* USER CODE BEGIN 0 */
 
+#if CFG_NVM
       /* Register Persistent data change notification */
       ZbPersistNotifyRegister(zigbee_app_info.zb,APP_ZIGBEE_persist_notify_cb,NULL);
       /* Call the callback once here to save persistence data */
       APP_ZIGBEE_persist_notify_cb(zigbee_app_info.zb,NULL);
-
+#endif
       ZbZclAttrReportKick(multistate_cluster, true, NULL, NULL);
+      /* Extend default persistence timeouts. Default value of 10s is too frequent and is unnecessary in this application. */
+      uint32_t pers_tm = 0;
+      enum ZbStatusCodeT res = ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, 4, 0);
+      if (ZB_STATUS_SUCCESS == res) {
+    	  pers_tm *= 10;
+    	  ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, sizeof(pers_tm), 0);
+      }
+
       /* USER CODE END 0 */
     }
     else
@@ -626,6 +659,16 @@ static void APP_ZIGBEE_NwkForm(void)
       APP_DBG("Startup failed, attempting again after a short delay (%d ms)", APP_ZIGBEE_STARTUP_FAIL_DELAY);
       zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_FAIL_DELAY;
       /* USER CODE BEGIN 1 */
+      if (status != ZB_NWK_STATUS_NO_NETWORKS) {
+    	  zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_REJOIN_DELAY;
+      }
+      if (status == ZB_NWK_STATUS_INVALID_REQUEST || ZB_APS_STATUS_SECURITY_FAIL == status) {
+    	  /* Some router devices return these error codes during first join and M0 firmware becomes
+    	   * unable to join after that. It keeps sending same data and receives same error code
+    	   * over and over again.
+    	   * Restarting the joining process with ZbReset() seems to help most of the time. */
+    	  ZbReset(zigbee_app_info.zb);
+      }
 
       /* USER CODE END 1 */
     }
@@ -1012,26 +1055,9 @@ app_msg_filter_callback(struct ZigBeeT *zb, uint32_t id, void *msg, void *arg)
 					UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
 				}
 			}
-		}
+	}
 
-	    if (id == ZB_MSG_FILTER_STATUS_IND) {
-	        struct ZbNlmeNetworkStatusIndT *ind = msg;
-
-	        switch (ind->status) {
-	            case ZB_NWK_STATUS_CODE_PARENT_LINK_FAILURE:
-	                /* Set a flag for application to attempt to rejoin network */
-	                /* Since we will handle this in the application, tell stack
-	                 * to not process this message further by returning ZB_MSG_DISCARD. */
-					APP_DBG("Network Lost / Parent Link Failure");
-					ZIGBEE_attempt_rejoin();
-	                res = ZB_MSG_DISCARD;
-
-	            default:
-	                break;
-	        }
-	    }
-
-		return res;
+	return res;
 }
 
 static struct my_zb_app_data {

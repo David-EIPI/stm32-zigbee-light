@@ -305,9 +305,9 @@ typedef enum
    CFG_EE_AUTO_CLEAN : Clean the flash automatically when needed
 */
 
-#define CFG_NB_OF_PAGE                          (16U)
+#define CFG_NB_OF_PAGE                          (32U)
 #define CFG_EE_BANK0_SIZE                       (CFG_NB_OF_PAGE * HW_FLASH_PAGE_SIZE)
-#define CFG_NVM_BASE_ADDRESS                    ( 0x70000U )
+#define CFG_NVM_BASE_ADDRESS                    ( 0x60000U )
 #define CFG_EE_BANK0_MAX_NB                     (1000U)                  // In U32 words
 #define ST_PERSIST_MAX_ALLOC_SZ                 (4U*CFG_EE_BANK0_MAX_NB) // Max data in bytes
 #define ST_PERSIST_FLASH_DATA_OFFSET            (4U)
