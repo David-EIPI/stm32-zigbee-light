@@ -278,6 +278,13 @@ typedef enum
 #define APPLI_PRINT_FILE_FUNC_LINE    0
 
 /* USER CODE BEGIN Defines */
+/***************************
+* Zigbee Application configuration and parameters
+****************************/
+#define MANUFACTURER_NAME "\x02" "DS"
+#define MODEL_NAME "\x06" "Model1"
+#define LOCATION "\x0d" "Outdoor light"
+
 /******************************************************************************
  * NVM
  ******************************************************************************/
@@ -337,8 +344,6 @@ typedef enum
 #endif /* (CFG_USB_INTERFACE_ENABLE != 0) */
   /* USER CODE BEGIN CFG_IdleTask_Id_t */
   CFG_TASK_MAIN_LOOP,
-  CFG_TASK_ZB_LEAVE,
-  CFG_TASK_ZIGBEE_NETWORK_REJOIN,
   /* USER CODE END CFG_IdleTask_Id_t */
   CFG_TASK_NBR  /**< Shall be last in the list */
 } CFG_IdleTask_Id_t;

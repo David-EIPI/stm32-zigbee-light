@@ -347,10 +347,6 @@ void seq_main_loop(void)
 	UTIL_SEQ_SetTask(1<< CFG_TASK_MAIN_LOOP, CFG_SCH_PRIO_1);
 }
 
-void seq_zb_leave(void)
-{
-}
-
 #if CFG_DEBUG_TRACE
 /* Debugging routine to direct the log output to the USB */
 int _write(int file, char *ptr, int len) {
@@ -457,19 +453,11 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   UTIL_SEQ_RegTask(1<< CFG_TASK_MAIN_LOOP, UTIL_SEQ_RFU, seq_main_loop);
-  UTIL_SEQ_RegTask(1<< CFG_TASK_ZB_LEAVE, UTIL_SEQ_RFU, seq_zb_leave);
   UTIL_SEQ_SetTask(1<< CFG_TASK_MAIN_LOOP, CFG_SCH_PRIO_1);
   APP_DBG("Test debug output\n");
 
-//  int cnt = 0;
   while (1)
   {
-//	  delay_ms(100);
-//	  HAL_Delay(100);
-//      if (cnt++ >= 1) {
-//		  HAL_GPIO_TogglePin(BOARDLED_GPIO_Port, BOARDLED_Pin);
-//		  cnt = 0;
-//	  }
     /* USER CODE END WHILE */
     MX_APPE_Process();
 

@@ -60,7 +60,6 @@
 /* Private defines -----------------------------------------------------------*/
 #define APP_ZIGBEE_STARTUP_FAIL_DELAY               500U
 #define CHANNEL                                     25
-#define ZED_SLEEP_TIME_30S                           1 /* 30s sleep time unit */
 
 #define SW1_ENDPOINT                                1
 #define SW2_ENDPOINT                                2
@@ -139,9 +138,7 @@ enum ZclStatusCodeT analog_presentValue_CB(struct ZbZclClusterT *clusterPtr, str
 
 static void APP_ZIGBEE_setup_filter(void);
 static void APP_ZIGBEE_ConfigBasic(void);
-static void APP_ZIGBEE_NwkRejoin(void);
 
-static void APP_ZIGBEE_ConfigBasic(void);
 void set_default_attr_values(void);
 
 static bool APP_ZIGBEE_persist_load(void);
@@ -286,11 +283,11 @@ struct analog_cluster_attr {
 		{
 				.mode = ANALOG_OUTPUT,
 				.desc = "\x0d" "Phase correct",
-				.value = -0.3,
-				.minPresent = -10.0,
-				.maxPresent = 10,
-				.step = 0.001,
-				.engUnit = ZCL_ENGINEERING_UNIT_MILLISECONDS,
+				.value = -300,
+				.minPresent = -10000.0,
+				.maxPresent = 10000,
+				.step = 1,
+				.engUnit = ZCL_ENGINEERING_UNIT_MICROSECONDS,
 				.icon = ZCL_ANALOG_ICON_TIMER,
 				.extSetting = &phase_correction,
 		},
@@ -342,7 +339,7 @@ void APP_ZIGBEE_Init(void)
   UTIL_SEQ_RegTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, UTIL_SEQ_RFU, APP_ZIGBEE_NwkForm);
 
   /* USER CODE BEGIN APP_ZIGBEE_INIT */
-  UTIL_SEQ_RegTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, UTIL_SEQ_RFU, APP_ZIGBEE_NwkRejoin);
+//  UTIL_SEQ_RegTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, UTIL_SEQ_RFU, APP_ZIGBEE_NwkRejoin);
 
   /* NVM Init */
 #if CFG_NVM
@@ -588,6 +585,7 @@ static void APP_ZIGBEE_ConfigEndpoints(void)
 #endif
 
   APP_ZIGBEE_ConfigBasic();
+  set_default_attr_values();
   /* USER CODE END CONFIG_ENDPOINT */
 }
 
@@ -610,7 +608,7 @@ static void APP_ZIGBEE_NwkForm(void)
     ZbStartupConfigGetProDefaults(&config);
 
     /* Set the centralized network */
-    APP_DBG("Network config : APP_STARTUP_CENTRALIZED_END_DEVICE");
+    APP_DBG("Network config : APP_STARTUP_CENTRALIZED_ROUTER");
     config.startupControl = zigbee_app_info.startupControl;
 
     /* Using the default HA preconfigured Link Key */
@@ -619,10 +617,6 @@ static void APP_ZIGBEE_NwkForm(void)
     config.channelList.count = 1;
     config.channelList.list[0].page = 0;
     config.channelList.list[0].channelMask = 1 << CHANNEL; /*Channel in use */
-
-    /* Add End device configuration */
-    config.capability &= ~(MCP_ASSOC_CAP_RXONIDLE | MCP_ASSOC_CAP_DEV_TYPE | MCP_ASSOC_CAP_ALT_COORD);
-    config.endDeviceTimeout=ZED_SLEEP_TIME_30S;
 
     /* Using ZbStartupWait (blocking) */
     status = ZbStartupWait(zigbee_app_info.zb, &config);
@@ -1026,16 +1020,6 @@ static void APP_ZIGBEE_ProcessRequestM0ToM4(void)
 /* USER CODE BEGIN FD_LOCAL_FUNCTIONS */
 
 
-void ZIGBEE_attempt_rejoin(void)
-{
-
-	zigbee_app_info.join_status = (enum ZbStatusCodeT) 0x03; /* init to error status */
-	zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_FAIL_DELAY;
-
-//	UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
-	UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, CFG_SCH_PRIO_0);
-}
-
 /* callback function */
 static enum zb_msg_filter_rc
 app_msg_filter_callback(struct ZigBeeT *zb, uint32_t id, void *msg, void *arg)
@@ -1066,11 +1050,11 @@ static struct my_zb_app_data {
 
 static void APP_ZIGBEE_setup_filter(void)
 {
-	/* callback intialization */
+	/* callback initialization */
 
 	struct ZigBeeT *zb = zigbee_app_info.zb;
-	(void)ZbMsgFilterRegister(zb,
-			ZB_MSG_FILTER_LEAVE_IND | ZB_MSG_FILTER_STATUS_IND,
+	(void)ZbMsgFilterRegister(zb, 0xffff,
+//			ZB_MSG_FILTER_LEAVE_IND | ZB_MSG_FILTER_STATUS_IND,
 			ZB_MSG_DEFAULT_PRIO, app_msg_filter_callback, &my_zb_app_data);
 }
 
@@ -1108,34 +1092,6 @@ enum ZbStatusCodeT ZbStartupRejoinWait(struct ZigBeeT *zb)
 } /* ZbStartupRejoinWait */
 
 
-static void APP_ZIGBEE_NwkRejoin(void)
-{
-	enum ZbStatusCodeT status;
-	status = ZbStartupRejoinWait(zigbee_app_info.zb);
-	zigbee_app_info.join_status = status;
-
-	if(status != ZB_STATUS_SUCCESS) {
-	/* Handle error. Try to rejoin again later? */
-		APP_DBG("Rejoin failure / Retry in 2 seconds");
-	    zigbee_app_info.join_delay = HAL_GetTick() + 2000;
-	    zigbee_app_info.startupControl = ZbStartTypeJoin;
-
-	    if (status == ZB_NWK_STATUS_INVALID_REQUEST) {
-			UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
-	    } else {
-			UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, CFG_SCH_PRIO_0);
-	    }
-	}
-	else
-	{
-		APP_DBG("Rejoin success");
-	}
-
-	if (zigbee_app_info.join_status != ZB_STATUS_SUCCESS)
-	{
-	}
-}
-
 /**
  * @brief  Setup basic cluster attributes.
  * @param  None
@@ -1143,15 +1099,15 @@ static void APP_ZIGBEE_NwkRejoin(void)
  */
 static void APP_ZIGBEE_ConfigBasic(void)
 {
- 	uint8_t mfr_str[] = "\x02" "DS";
+ 	uint8_t mfr_str[] = MANUFACTURER_NAME;
  	ZbZclBasicWriteDirect(zigbee_app_info.zb, SW1_ENDPOINT,
  			ZCL_BASIC_ATTR_MFR_NAME, mfr_str, sizeof(mfr_str) - 1);
 
- 	uint8_t model_str[] = "\x06" "Model1";
+ 	uint8_t model_str[] = MODEL_NAME;
  	ZbZclBasicWriteDirect(zigbee_app_info.zb, SW1_ENDPOINT,
  			ZCL_BASIC_ATTR_MODEL_NAME, model_str, sizeof(model_str) - 1);
 
- 	uint8_t location_str[] = "\x0d" "Outdoor light";
+ 	uint8_t location_str[] = LOCATION;
  	ZbZclBasicWriteDirect(zigbee_app_info.zb, SW1_ENDPOINT,
  			ZCL_BASIC_ATTR_LOCATION, model_str, sizeof(location_str) - 1);
 

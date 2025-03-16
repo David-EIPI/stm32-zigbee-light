@@ -15,7 +15,6 @@ class lightOperationModes(t.enum8):
     Dimmed = 0x03
     Off = 0x04
 
-
 # ZHA incorrectly uses Float type for Present Value attribute in Multistate cluster. 
 # According to ZCL spec this attribute type should be uint16.
 
@@ -26,6 +25,11 @@ class fixMultistateValue(CustomCluster, MultistateValue):
             0x0055: ("present_value", t.uint16_t, True)
         }
     )
+
+# Add microseconds to the units list
+from zha.application.platforms.number.const import UNITS
+if UNITS[194] == None:
+    UNITS[194] = "Microseconds"
 
 (
     QuirkBuilder("DS", "Model1")
