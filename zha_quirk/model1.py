@@ -26,11 +26,6 @@ class fixMultistateValue(CustomCluster, MultistateValue):
         }
     )
 
-# Add microseconds to the units list
-from zha.application.platforms.number.const import UNITS
-if UNITS[194] == None:
-    UNITS[194] = "Microseconds"
-
 (
     QuirkBuilder("DS", "Model1")
     .enum(
