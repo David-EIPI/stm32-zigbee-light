@@ -42,11 +42,13 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/* Rough ambient light level correction for the self-illumination effect when the light is on */
+#define CORRECT_SELF_ILLUM 3
+
 /* Default values to use when not set remotely */
 /* Range: 0-100 % */
 #define DEFAULT_AMBIENT_THRESHOLD 50
 #define DEFAULT_DIM_LEVEL 50
-
 
 /* USER CODE END PD */
 
@@ -290,13 +292,15 @@ void check_and_update_light_level(void)
 /* Check the ambient light level to detect the dusk and the dawn */
 static void detect_dusk_transition(void)
 {
-/* Detect transitions only when the light is off and at least 1 min after it was on to have the sensor settled */
+	int adjustedIllum = (int)controls.log2illum;
+
+/* Roughly correct for self effect when the light is on and at least 1min after it was on till the sensor is settled */
 	if (lightLevel > 0 || timeSeconds - abs(lightOnTime) < 60)
-		return;
+		adjustedIllum -= CORRECT_SELF_ILLUM;
 
 	/* Dark to light transition: detect dawn */
 	if ((duskTime > 0)
-			&& ((int)controls.log2illum > ambientThreshold)
+			&& (adjustedIllum > ambientThreshold)
 			) {
 		dawnTransition = prevIllum;
 		duskTime = 0;
@@ -304,12 +308,12 @@ static void detect_dusk_transition(void)
 
 	/* Light to dark transition: detect dusk */
 	if ((duskTime == 0)
-			&& ((int)controls.log2illum < ambientThreshold)
+			&& (adjustedIllum < ambientThreshold)
 			) {
 		duskTransition = prevIllum;
 		duskTime = timeSeconds;
 	}
-	prevIllum = controls.log2illum;
+	prevIllum = adjustedIllum;
 	APP_ZIGBEE_update_dusk_detect(duskTime > 0);
 }
 
@@ -345,6 +349,12 @@ void seq_main_loop(void)
 	}
 
 	UTIL_SEQ_SetTask(1<< CFG_TASK_MAIN_LOOP, CFG_SCH_PRIO_1);
+}
+
+/* Setup daily restart */
+void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc)
+{
+	HAL_NVIC_SystemReset();
 }
 
 #if CFG_DEBUG_TRACE
@@ -787,6 +797,10 @@ static void MX_RTC_Init(void)
 
   /* USER CODE END RTC_Init 0 */
 
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+  RTC_AlarmTypeDef sAlarm = {0};
+
   /* USER CODE BEGIN RTC_Init 1 */
 
   /* USER CODE END RTC_Init 1 */
@@ -802,6 +816,50 @@ static void MX_RTC_Init(void)
   hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
   hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
   if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.SubSeconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Enable the Alarm A
+  */
+  sAlarm.AlarmTime.Hours = 0x23;
+  sAlarm.AlarmTime.Minutes = 0x59;
+  sAlarm.AlarmTime.Seconds = 0x59;
+  sAlarm.AlarmTime.SubSeconds = 0x0;
+  sAlarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sAlarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  sAlarm.AlarmMask = RTC_ALARMMASK_HOURS|RTC_ALARMMASK_MINUTES
+                              |RTC_ALARMMASK_SECONDS;
+  sAlarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
+  sAlarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+  sAlarm.AlarmDateWeekDay = 0x1;
+  sAlarm.Alarm = RTC_ALARM_A;
+  if (HAL_RTC_SetAlarm(&hrtc, &sAlarm, RTC_FORMAT_BCD) != HAL_OK)
   {
     Error_Handler();
   }
