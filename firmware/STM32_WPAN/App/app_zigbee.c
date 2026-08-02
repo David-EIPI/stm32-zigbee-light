@@ -87,6 +87,15 @@
 
 #define APP_ZIGBEE_STARTUP_REJOIN_DELAY               5000U
 
+#define APP_ZIGBEE_REJOIN_ATTEMPTS_MAX                 2U
+#define APP_ZIGBEE_TC_REJOIN_COOLDOWN_MS                60000U
+#define APP_ZIGBEE_PERSIST_TIMEOUT_MS                   100000U
+#define APP_ZIGBEE_DIAG_MAGIC                          0x5a424447UL /* "ZBDG" */
+#define APP_ZIGBEE_DIAG_VERSION                        1U
+#define APP_ZIGBEE_DIAG_WORDS                          16U
+#define APP_ZIGBEE_DIAG_START_ADDR                     (CFG_EE_BANK0_MAX_NB - APP_ZIGBEE_DIAG_WORDS)
+#define APP_ZIGBEE_PERSIST_CAPACITY                    ((APP_ZIGBEE_DIAG_START_ADDR * 4U) - ST_PERSIST_FLASH_DATA_OFFSET)
+
 /* USER CODE END PD */
 
 /* Private macros ------------------------------------------------------------*/
@@ -147,6 +156,17 @@ static void APP_ZIGBEE_persist_delete(void);
 static void APP_ZIGBEE_persist_notify_cb(struct ZigBeeT *zb, void *cbarg);
 static enum ZbStatusCodeT APP_ZIGBEE_ZbStartupPersist(struct ZigBeeT *zb);
 static void APP_ZIGBEE_PersistCompleted_callback(enum ZbStatusCodeT status,void *arg);
+static void APP_ZIGBEE_RecoveryTask(void);
+static void APP_ZIGBEE_request_recovery(uint32_t event);
+static void APP_ZIGBEE_request_trust_center_rejoin(void);
+static void APP_ZIGBEE_TrustCenterRejoinCompleted_callback(enum ZbStatusCodeT status, void *arg);
+static void APP_ZIGBEE_mark_joined(void);
+static void APP_ZIGBEE_start_coordinator_probe(void);
+static void APP_ZIGBEE_CoordinatorProbeCompleted_callback(struct ZbZdoNodeDescRspT *rsp, void *arg);
+static void APP_ZIGBEE_diag_record(uint32_t event, uint32_t status, uint16_t short_addr);
+static bool APP_ZIGBEE_diag_load(void);
+static bool APP_ZIGBEE_diag_save(void);
+static uint32_t APP_ZIGBEE_crc32_update(uint32_t crc, const void *data, size_t len);
 
 
 #ifdef CFG_NVM
@@ -188,6 +208,69 @@ static struct zigbee_app_info zigbee_app_info;
 /* NVM variables */
 
 static unsigned int persistNumWrites = 0;
+
+enum app_zigbee_recovery_state {
+	APP_ZIGBEE_RECOVERY_BOOT,
+	APP_ZIGBEE_RECOVERY_PERSIST_PENDING,
+	APP_ZIGBEE_RECOVERY_JOINED,
+	APP_ZIGBEE_RECOVERY_PROBE_PENDING,
+	APP_ZIGBEE_RECOVERY_REJOIN_REQUESTED,
+	APP_ZIGBEE_RECOVERY_REJOIN_PENDING,
+	APP_ZIGBEE_RECOVERY_FRESH_JOIN_REQUESTED,
+	APP_ZIGBEE_RECOVERY_FRESH_JOIN_PENDING,
+	APP_ZIGBEE_RECOVERY_TC_REJOIN_REQUESTED,
+	APP_ZIGBEE_RECOVERY_TC_REJOIN_PENDING,
+};
+
+enum app_zigbee_diag_event {
+	APP_ZIGBEE_DIAG_NONE,
+	APP_ZIGBEE_DIAG_PERSIST_ACCEPTED,
+	APP_ZIGBEE_DIAG_PERSIST_COMPLETE,
+	APP_ZIGBEE_DIAG_PERSIST_FAILED,
+	APP_ZIGBEE_DIAG_LEAVE,
+	APP_ZIGBEE_DIAG_NETWORK_STATUS,
+	APP_ZIGBEE_DIAG_REJOIN_STARTED,
+	APP_ZIGBEE_DIAG_REJOIN_COMPLETE,
+	APP_ZIGBEE_DIAG_FRESH_JOIN_STARTED,
+	APP_ZIGBEE_DIAG_FRESH_JOIN_COMPLETE,
+	APP_ZIGBEE_DIAG_PROBE_STARTED,
+	APP_ZIGBEE_DIAG_PROBE_COMPLETE,
+	APP_ZIGBEE_DIAG_TC_REJOIN_STARTED,
+	APP_ZIGBEE_DIAG_TC_REJOIN_COMPLETE,
+};
+
+struct app_zigbee_diag_record {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t sequence;
+	uint32_t last_event;
+	uint32_t last_status;
+	uint32_t last_short_addr;
+	uint32_t persist_failures;
+	uint32_t leave_events;
+	uint32_t network_status_events;
+	uint32_t recovery_attempts;
+	uint32_t successful_recoveries;
+	uint32_t last_persist_status;
+	uint32_t last_leave_short_addr;
+	uint32_t last_network_status;
+	uint32_t last_network_short_addr;
+	uint32_t crc32;
+};
+
+static struct app_zigbee_diag_record zigbee_diag;
+static enum app_zigbee_recovery_state recovery_state = APP_ZIGBEE_RECOVERY_BOOT;
+static bool persist_record_present;
+static bool persist_record_valid;
+static bool nvm_ready;
+static bool diag_dirty;
+static bool persist_reference_valid;
+static uint16_t persist_reference_words;
+static unsigned int persistNumWordsWritten;
+static uint8_t rejoin_attempts;
+static uint8_t trust_center_rejoin_attempts;
+static uint32_t last_trust_center_rejoin_tick;
+static uint64_t local_extended_address;
 
 /* cache in uninit RAM to store/retrieve persistent data */
 union cache
@@ -299,8 +382,15 @@ static uint8_t motionState = 0;
 static uint8_t duskState = 0;
 
 /* Data block for NVM storage */
+struct persistence_attrs_v1 {
+	uint32_t struct_len;
+	float analogValues[lengthof(analog_cluster_attrs)];
+	uint32_t multistateValue;
+};
+
 struct persistence_attrs {
 	uint32_t struct_len;
+	uint32_t crc32;
 	float analogValues[lengthof(analog_cluster_attrs)];
 	uint32_t multistateValue;
 };
@@ -340,6 +430,7 @@ void APP_ZIGBEE_Init(void)
 
   /* USER CODE BEGIN APP_ZIGBEE_INIT */
 //  UTIL_SEQ_RegTask(1U << CFG_TASK_ZIGBEE_NETWORK_REJOIN, UTIL_SEQ_RFU, APP_ZIGBEE_NwkRejoin);
+  UTIL_SEQ_RegTask(1U << CFG_TASK_ZIGBEE_RECOVERY, UTIL_SEQ_RFU, APP_ZIGBEE_RecoveryTask);
 
   /* NVM Init */
 #if CFG_NVM
@@ -376,9 +467,10 @@ static void APP_ZIGBEE_StackLayersInit(void)
   /* USER CODE BEGIN APP_ZIGBEE_StackLayersInit */
   zigbee_app_info.join_status = (enum ZbStatusCodeT) 0x01; /* init to error status */
   APP_ZIGBEE_setup_filter();
+  local_extended_address = ZbExtendedAddress(zigbee_app_info.zb);
 
   /* STEP 1 - TRY to START FROM PERSISTENCE */
-  enum ZbStatusCodeT status = ZbNwkIfSetTxPower(zigbee_app_info.zb, "wpan0", 6) ? 1 : 0;
+  enum ZbStatusCodeT status;
 
   /* First we disable the persistent notification */
   ZbPersistNotifyRegister(zigbee_app_info.zb,NULL,NULL);
@@ -393,7 +485,7 @@ static void APP_ZIGBEE_StackLayersInit(void)
   res = ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
   if (ZB_STATUS_SUCCESS == res) {
 	  bdb_flags |= ZB_BDB_FLAG_IGNORE_COST_DURING_JOIN;
-	  ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
+	  (void)ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
   }
 
 
@@ -407,27 +499,23 @@ static void APP_ZIGBEE_StackLayersInit(void)
   status = APP_ZIGBEE_ZbStartupPersist(zigbee_app_info.zb);
   if(status == ZB_STATUS_SUCCESS)
   {
-     /* no fresh startup need anymore */
-     APP_DBG("ZbStartupPersist: SUCCESS, restarted from persistence");
-
-     /* Extend default persistence timeouts. Default value of 10s is too frequent and is unnecessary in this application. */
-     uint32_t pers_tm = 0;
-     res = ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, 4, 0);
-     if (ZB_STATUS_SUCCESS == res) {
-   	  pers_tm *= 10;
-   	  ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, sizeof(pers_tm), 0);
-     }
-
-     zigbee_app_info.join_delay = HAL_GetTick(); /* now */
-     zigbee_app_info.startupControl = ZbStartTypeJoin;
-     zigbee_app_info.join_status = ZB_STATUS_SUCCESS;
-     ZbZclAttrReportKick(multistate_cluster, true, NULL, NULL);
+     /* The return value only means that CPU2 accepted the asynchronous request.
+      * Network state is marked joined by APP_ZIGBEE_PersistCompleted_callback(). */
+     APP_DBG("ZbStartupPersist: request accepted; waiting for completion");
+     recovery_state = APP_ZIGBEE_RECOVERY_PERSIST_PENDING;
+     zigbee_app_info.has_init = true;
+     APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_PERSIST_ACCEPTED, status, 0xffffU);
      return;
   }
   else
   {
-       /* Start-up form persistence failed perform a fresh ZbStartup */
-       APP_DBG("ZbStartupPersist: FAILED to restart from persistence with status: 0x%02x",status);
+       APP_DBG("ZbStartupPersist: request rejected with status: 0x%02x",status);
+       if (persist_record_present) {
+         APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_PERSIST_FAILED, status, 0xffffU);
+         APP_ZIGBEE_request_recovery(APP_ZIGBEE_DIAG_PERSIST_FAILED);
+         zigbee_app_info.has_init = true;
+         return;
+       }
   }
   /* USER CODE END APP_ZIGBEE_StackLayersInit */
 
@@ -637,14 +725,18 @@ static void APP_ZIGBEE_NwkForm(void)
       /* Call the callback once here to save persistence data */
       APP_ZIGBEE_persist_notify_cb(zigbee_app_info.zb,NULL);
 #endif
+      recovery_state = APP_ZIGBEE_RECOVERY_JOINED;
+      rejoin_attempts = 0U;
+      APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_FRESH_JOIN_COMPLETE, status, ZbShortAddress(zigbee_app_info.zb));
+      zigbee_diag.successful_recoveries++;
+      diag_dirty = true;
+      UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RECOVERY, CFG_SCH_PRIO_0);
       ZbZclAttrReportKick(multistate_cluster, true, NULL, NULL);
-      /* Extend default persistence timeouts. Default value of 10s is too frequent and is unnecessary in this application. */
-      uint32_t pers_tm = 0;
-      enum ZbStatusCodeT res = ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, 4, 0);
-      if (ZB_STATUS_SUCCESS == res) {
-    	  pers_tm *= 10;
-    	  ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs, &pers_tm, sizeof(pers_tm), 0);
-      }
+      /* Use an absolute value. Multiplying the current value after every
+       * recovery caused exponential growth and eventual integer overflow. */
+      uint32_t pers_tm = APP_ZIGBEE_PERSIST_TIMEOUT_MS;
+      (void)ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs,
+		      &pers_tm, sizeof(pers_tm), 0);
 
       /* USER CODE END 0 */
     }
@@ -654,15 +746,17 @@ static void APP_ZIGBEE_NwkForm(void)
       zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_FAIL_DELAY;
       /* USER CODE BEGIN 1 */
       if (status != ZB_NWK_STATUS_NO_NETWORKS) {
-    	  zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_REJOIN_DELAY;
+	  zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_REJOIN_DELAY;
       }
       if (status == ZB_NWK_STATUS_INVALID_REQUEST || ZB_APS_STATUS_SECURITY_FAIL == status) {
     	  /* Some router devices return these error codes during first join and M0 firmware becomes
     	   * unable to join after that. It keeps sending same data and receives same error code
     	   * over and over again.
     	   * Restarting the joining process with ZbReset() seems to help most of the time. */
-    	  ZbReset(zigbee_app_info.zb);
+	  ZbReset(zigbee_app_info.zb);
       }
+      recovery_state = APP_ZIGBEE_RECOVERY_FRESH_JOIN_PENDING;
+      APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_FRESH_JOIN_COMPLETE, status, 0xffffU);
 
       /* USER CODE END 1 */
     }
@@ -674,6 +768,9 @@ static void APP_ZIGBEE_NwkForm(void)
     UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
   }
   /* USER CODE BEGIN NW_FORM */
+  if (diag_dirty) {
+	  UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RECOVERY, CFG_SCH_PRIO_0);
+  }
   /* USER CODE END NW_FORM */
 }
 
@@ -1026,19 +1123,37 @@ app_msg_filter_callback(struct ZigBeeT *zb, uint32_t id, void *msg, void *arg)
 {
 	enum zb_msg_filter_rc res = ZB_MSG_CONTINUE;
 
-	if (0 != (id & (ZB_MSG_FILTER_LEAVE_IND | ZB_MSG_FILTER_STATUS_IND))) {
+	if (id == ZB_MSG_FILTER_LEAVE_IND) {
+		struct ZbNlmeLeaveIndT *ind = msg;
+		bool local_leave = (ind->deviceAddr == local_extended_address);
 
-			if (0 != (id & ZB_MSG_FILTER_LEAVE_IND)) {
-				struct ZbNlmeLeaveIndT *ind = msg;
-/*
- * If this device was permanently removed from the network, resume searching for an available network.
- * */
-				if (!ind->rejoin) {
-					zigbee_app_info.join_status = (enum ZbStatusCodeT) 0x04; /* init to error status */
-					zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_FAIL_DELAY;
-					UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
-				}
-			}
+		zigbee_diag.leave_events++;
+
+		/* A router receives leave indications for children and former neighbors.
+		 * Only an indication naming our own EUI means this device left the network. */
+		if (local_leave && !ind->rejoin) {
+			APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_LEAVE,
+					ind->rejoin ? 1U : 0U, ind->shortAddr);
+			APP_ZIGBEE_request_recovery(APP_ZIGBEE_DIAG_LEAVE);
+		}
+	}
+	else if (id == ZB_MSG_FILTER_STATUS_IND) {
+		struct ZbNlmeNetworkStatusIndT *ind = msg;
+
+		zigbee_diag.network_status_events++;
+		zigbee_diag.last_network_status = (uint32_t)ind->status;
+		zigbee_diag.last_network_short_addr = ind->shortAddr;
+
+		/* NWK status messages report failures for individual routed packets; they
+		 * do not mean that a mains-powered router has left the network. Acting on
+		 * route or parent-link failures here previously tore down a working router.
+		 * BAD_KEY_SEQNUM is different: the coordinator is explicitly reporting a
+		 * network-key sequence mismatch, for which the stack provides a dedicated
+		 * Trust Center rejoin procedure. */
+		if ((ind->shortAddr == ZB_NWK_ADDR_COORDINATOR) &&
+				(ind->status == ZB_NWK_STATUS_CODE_BAD_KEY_SEQNUM)) {
+			APP_ZIGBEE_request_trust_center_rejoin();
+		}
 	}
 
 	return res;
@@ -1053,9 +1168,125 @@ static void APP_ZIGBEE_setup_filter(void)
 	/* callback initialization */
 
 	struct ZigBeeT *zb = zigbee_app_info.zb;
-	(void)ZbMsgFilterRegister(zb, 0xffff,
-//			ZB_MSG_FILTER_LEAVE_IND | ZB_MSG_FILTER_STATUS_IND,
+	struct ZbMsgFilterT *filter = ZbMsgFilterRegister(zb,
+			ZB_MSG_FILTER_LEAVE_IND | ZB_MSG_FILTER_STATUS_IND,
 			ZB_MSG_DEFAULT_PRIO, app_msg_filter_callback, &my_zb_app_data);
+	if (filter == NULL) {
+		APP_DBG("Failed to register Zigbee network event filter");
+	}
+}
+
+static void APP_ZIGBEE_RejoinCompleted_callback(struct ZbNlmeJoinConfT *conf, void *arg)
+{
+	APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_REJOIN_COMPLETE,
+			(uint32_t)conf->status, conf->nwkAddr);
+
+	if (conf->status == ZB_STATUS_SUCCESS) {
+		zigbee_diag.successful_recoveries++;
+		diag_dirty = true;
+		/* Rejoin may update the parent, short address, or security counters.
+		 * Commit that refreshed stack state before normal notifications resume. */
+		(void)APP_ZIGBEE_persist_save();
+		APP_ZIGBEE_mark_joined();
+		return;
+	}
+
+	if (rejoin_attempts < APP_ZIGBEE_REJOIN_ATTEMPTS_MAX) {
+		/* Retry without resetting: ZbStartupRejoin is only valid while the stack
+		 * still considers itself connected to the restored network. */
+		recovery_state = APP_ZIGBEE_RECOVERY_REJOIN_REQUESTED;
+	}
+	else {
+		/* A failed reachability repair must not strand an already commissioned
+		 * router in fresh-join mode while permit-join is closed. Keep credentials
+		 * and the restored stack state; later traffic or a reboot can recover it. */
+		APP_ZIGBEE_mark_joined();
+	}
+	UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RECOVERY, CFG_SCH_PRIO_0);
+}
+
+static void APP_ZIGBEE_TrustCenterRejoinCompleted_callback(enum ZbStatusCodeT status, void *arg)
+{
+	UNUSED(arg);
+	last_trust_center_rejoin_tick = HAL_GetTick();
+	APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_TC_REJOIN_COMPLETE,
+			(uint32_t)status, ZbShortAddress(zigbee_app_info.zb));
+
+	if (status == ZB_STATUS_SUCCESS) {
+		zigbee_diag.successful_recoveries++;
+		(void)APP_ZIGBEE_persist_save();
+		APP_ZIGBEE_mark_joined();
+	}
+	else {
+		/* Preserve the current network and allow another security repair only
+		 * after the cooldown. Never turn a key mismatch into a factory reset. */
+		recovery_state = APP_ZIGBEE_RECOVERY_JOINED;
+		zigbee_app_info.join_status = ZB_STATUS_SUCCESS;
+	}
+}
+
+static void APP_ZIGBEE_RecoveryTask(void)
+{
+	enum ZbStatusCodeT status;
+
+	if (diag_dirty) {
+		(void)APP_ZIGBEE_diag_save();
+	}
+
+	if (recovery_state == APP_ZIGBEE_RECOVERY_REJOIN_REQUESTED) {
+		rejoin_attempts++;
+		zigbee_diag.recovery_attempts++;
+		APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_REJOIN_STARTED,
+				rejoin_attempts, 0xffffU);
+		(void)ZbPersistNotifyRegister(zigbee_app_info.zb, NULL, NULL);
+		zigbee_app_info.join_status = ZB_NWK_STATUS_NO_NETWORKS;
+
+		status = ZbStartupRejoin(zigbee_app_info.zb,
+				APP_ZIGBEE_RejoinCompleted_callback, NULL);
+		if (status == ZB_STATUS_SUCCESS) {
+			recovery_state = APP_ZIGBEE_RECOVERY_REJOIN_PENDING;
+		}
+		else if (rejoin_attempts < APP_ZIGBEE_REJOIN_ATTEMPTS_MAX) {
+			APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_REJOIN_COMPLETE,
+					(uint32_t)status, 0xffffU);
+			recovery_state = APP_ZIGBEE_RECOVERY_REJOIN_REQUESTED;
+			UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RECOVERY, CFG_SCH_PRIO_0);
+		}
+		else {
+			APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_REJOIN_COMPLETE,
+					(uint32_t)status, 0xffffU);
+			APP_ZIGBEE_mark_joined();
+		}
+	}
+	else if (recovery_state == APP_ZIGBEE_RECOVERY_TC_REJOIN_REQUESTED) {
+		trust_center_rejoin_attempts++;
+		zigbee_diag.recovery_attempts++;
+		APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_TC_REJOIN_STARTED,
+				trust_center_rejoin_attempts, ZB_NWK_ADDR_COORDINATOR);
+		status = ZbTrustCenterRejoin(zigbee_app_info.zb,
+				APP_ZIGBEE_TrustCenterRejoinCompleted_callback, NULL);
+		if (status == ZB_STATUS_SUCCESS) {
+			recovery_state = APP_ZIGBEE_RECOVERY_TC_REJOIN_PENDING;
+		}
+		else {
+			APP_ZIGBEE_TrustCenterRejoinCompleted_callback(status, NULL);
+		}
+	}
+	else if (recovery_state == APP_ZIGBEE_RECOVERY_FRESH_JOIN_REQUESTED) {
+		/* This is a normal BDB join, not a factory reset. The saved record and
+		 * diagnostics remain available until a successful join supersedes them. */
+		APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_FRESH_JOIN_STARTED, 0U, 0xffffU);
+		ZbReset(zigbee_app_info.zb);
+		zigbee_app_info.startupControl = ZbStartTypeJoin;
+		zigbee_app_info.join_status = ZB_NWK_STATUS_NO_NETWORKS;
+		zigbee_app_info.join_delay = HAL_GetTick() + APP_ZIGBEE_STARTUP_REJOIN_DELAY;
+		recovery_state = APP_ZIGBEE_RECOVERY_FRESH_JOIN_PENDING;
+		UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_NETWORK_FORM, CFG_SCH_PRIO_0);
+	}
+
+	if (diag_dirty) {
+		(void)APP_ZIGBEE_diag_save();
+	}
 }
 
 
@@ -1107,9 +1338,9 @@ static void APP_ZIGBEE_ConfigBasic(void)
  	ZbZclBasicWriteDirect(zigbee_app_info.zb, SW1_ENDPOINT,
  			ZCL_BASIC_ATTR_MODEL_NAME, model_str, sizeof(model_str) - 1);
 
- 	uint8_t location_str[] = LOCATION;
- 	ZbZclBasicWriteDirect(zigbee_app_info.zb, SW1_ENDPOINT,
- 			ZCL_BASIC_ATTR_LOCATION, model_str, sizeof(location_str) - 1);
+	uint8_t location_str[] = LOCATION;
+	ZbZclBasicWriteDirect(zigbee_app_info.zb, SW1_ENDPOINT,
+			ZCL_BASIC_ATTR_LOCATION, location_str, sizeof(location_str) - 1);
 
  	uint8_t power_source = 0x01; // single phase
  	ZbZclBasicWriteDirect(zigbee_app_info.zb, SW1_ENDPOINT,
@@ -1261,31 +1492,280 @@ void APP_ZIGBEE_update_temperature(int16_t temp)
 	(void)ZbZclAttrIntegerWrite(zigbee_app_info.temperature_meas_server_1, ZCL_TEMP_MEAS_ATTR_MEAS_VAL, temp);
 }
 
+static uint32_t APP_ZIGBEE_crc32_update(uint32_t crc, const void *data, size_t len)
+{
+	const uint8_t *bytes = data;
+
+	while (len-- != 0U) {
+		crc ^= *bytes++;
+		for (unsigned bit = 0; bit < 8U; bit++) {
+			crc = (crc >> 1) ^ ((crc & 1U) ? 0xedb88320UL : 0U);
+		}
+	}
+	return crc;
+}
+
+static uint32_t APP_ZIGBEE_persist_crc(const uint8_t *stack_data, uint32_t stack_len,
+		const struct persistence_attrs *attrs)
+{
+	struct persistence_attrs copy;
+	uint32_t crc = 0xffffffffUL;
+
+	/* The stack blob has byte granularity, so its footer is not necessarily
+	 * word-aligned. Avoid compiler-generated LDM/STM instructions here. */
+	memcpy(&copy, attrs, sizeof(copy));
+	copy.crc32 = 0U;
+	crc = APP_ZIGBEE_crc32_update(crc, stack_data, stack_len);
+	crc = APP_ZIGBEE_crc32_update(crc, &copy, sizeof(copy));
+	return ~crc;
+}
+
+static void APP_ZIGBEE_diag_record(uint32_t event, uint32_t status, uint16_t short_addr)
+{
+	bool persist_event = false;
+
+	zigbee_diag.last_event = event;
+	zigbee_diag.last_status = status;
+	zigbee_diag.last_short_addr = short_addr;
+	if (event == APP_ZIGBEE_DIAG_PERSIST_FAILED) {
+		zigbee_diag.persist_failures++;
+		zigbee_diag.last_persist_status = status;
+		persist_event = true;
+	}
+	else if (event == APP_ZIGBEE_DIAG_LEAVE) {
+		zigbee_diag.last_leave_short_addr = short_addr;
+		persist_event = true;
+	}
+	else if (event == APP_ZIGBEE_DIAG_NETWORK_STATUS) {
+		zigbee_diag.last_network_status = status;
+		zigbee_diag.last_network_short_addr = short_addr;
+	}
+	else if ((event == APP_ZIGBEE_DIAG_REJOIN_STARTED) ||
+			(event == APP_ZIGBEE_DIAG_REJOIN_COMPLETE) ||
+			(event == APP_ZIGBEE_DIAG_FRESH_JOIN_STARTED) ||
+			((event == APP_ZIGBEE_DIAG_FRESH_JOIN_COMPLETE) &&
+			 (status == ZB_STATUS_SUCCESS)) ||
+			((event == APP_ZIGBEE_DIAG_PROBE_COMPLETE) &&
+			 (status != ZB_STATUS_SUCCESS)) ||
+			(event == APP_ZIGBEE_DIAG_TC_REJOIN_STARTED) ||
+			(event == APP_ZIGBEE_DIAG_TC_REJOIN_COMPLETE)) {
+		persist_event = true;
+	}
+
+	/* Diagnostics are a crash-recovery breadcrumb, not a telemetry log. Routine
+	 * status traffic and successful boots stay in RAM to avoid flash wear. */
+	if (persist_event) {
+		diag_dirty = true;
+		UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RECOVERY, CFG_SCH_PRIO_0);
+	}
+}
+
+static bool APP_ZIGBEE_diag_load(void)
+{
+	struct app_zigbee_diag_record record;
+	uint32_t *words = (uint32_t *)&record;
+
+	_Static_assert(sizeof(record) == APP_ZIGBEE_DIAG_WORDS * sizeof(uint32_t),
+			"Diagnostic record size must match reserved EEPROM words");
+
+	memset(&record, 0, sizeof(record));
+	if (!nvm_ready) {
+		return false;
+	}
+	for (uint16_t i = 0; i < APP_ZIGBEE_DIAG_WORDS; i++) {
+		if (EE_Read(0, APP_ZIGBEE_DIAG_START_ADDR + i, &words[i]) != EE_OK) {
+			return false;
+		}
+	}
+
+	uint32_t stored_crc = record.crc32;
+	record.crc32 = 0U;
+	uint32_t crc = ~APP_ZIGBEE_crc32_update(0xffffffffUL, &record, sizeof(record));
+	if ((record.magic != APP_ZIGBEE_DIAG_MAGIC) ||
+			(record.version != APP_ZIGBEE_DIAG_VERSION) || (crc != stored_crc)) {
+		return false;
+	}
+
+	record.crc32 = stored_crc;
+	zigbee_diag = record;
+	return true;
+}
+
+static bool APP_ZIGBEE_diag_save(void)
+{
+	uint32_t *words = (uint32_t *)&zigbee_diag;
+	int status = EE_OK;
+
+	if (!nvm_ready || !diag_dirty) {
+		return !diag_dirty;
+	}
+
+	zigbee_diag.magic = APP_ZIGBEE_DIAG_MAGIC;
+	zigbee_diag.version = APP_ZIGBEE_DIAG_VERSION;
+	zigbee_diag.sequence++;
+	zigbee_diag.crc32 = 0U;
+	zigbee_diag.crc32 = ~APP_ZIGBEE_crc32_update(0xffffffffUL,
+			&zigbee_diag, sizeof(zigbee_diag));
+
+	/* Write CRC last. A reset during the preceding writes leaves a record whose
+	 * old CRC cannot validate the mixed generation. */
+	for (uint16_t i = 0; i < APP_ZIGBEE_DIAG_WORDS - 1U; i++) {
+		status = EE_Write(0, APP_ZIGBEE_DIAG_START_ADDR + i, words[i]);
+		if (status != EE_OK) {
+			return false;
+		}
+	}
+	status = EE_Write(0, APP_ZIGBEE_DIAG_START_ADDR + APP_ZIGBEE_DIAG_WORDS - 1U,
+			words[APP_ZIGBEE_DIAG_WORDS - 1U]);
+	if (status == EE_OK) {
+		diag_dirty = false;
+		return true;
+	}
+	return false;
+}
+
+static void APP_ZIGBEE_request_recovery(uint32_t event)
+{
+	if ((recovery_state == APP_ZIGBEE_RECOVERY_REJOIN_PENDING) ||
+			(recovery_state == APP_ZIGBEE_RECOVERY_FRESH_JOIN_PENDING) ||
+			(recovery_state == APP_ZIGBEE_RECOVERY_TC_REJOIN_PENDING)) {
+		return;
+	}
+	rejoin_attempts = 0U;
+	/* Without a successfully restored stack there is no usable network key to
+	 * rejoin with. An explicit local leave likewise requires commissioning.
+	 * Reachability-probe failures retain the restored network and use bounded
+	 * in-network rejoin attempts. */
+	if ((event == APP_ZIGBEE_DIAG_PERSIST_FAILED) ||
+			(event == APP_ZIGBEE_DIAG_LEAVE)) {
+		recovery_state = APP_ZIGBEE_RECOVERY_FRESH_JOIN_REQUESTED;
+	}
+	else {
+		recovery_state = APP_ZIGBEE_RECOVERY_REJOIN_REQUESTED;
+	}
+	UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RECOVERY, CFG_SCH_PRIO_0);
+}
+
+static void APP_ZIGBEE_request_trust_center_rejoin(void)
+{
+	uint32_t now = HAL_GetTick();
+
+	if ((recovery_state != APP_ZIGBEE_RECOVERY_JOINED) ||
+			((last_trust_center_rejoin_tick != 0U) &&
+			 ((uint32_t)(now - last_trust_center_rejoin_tick) <
+					 APP_ZIGBEE_TC_REJOIN_COOLDOWN_MS))) {
+		return;
+	}
+	trust_center_rejoin_attempts = 0U;
+	recovery_state = APP_ZIGBEE_RECOVERY_TC_REJOIN_REQUESTED;
+	APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_NETWORK_STATUS,
+			ZB_NWK_STATUS_CODE_BAD_KEY_SEQNUM, ZB_NWK_ADDR_COORDINATOR);
+	UTIL_SEQ_SetTask(1U << CFG_TASK_ZIGBEE_RECOVERY, CFG_SCH_PRIO_0);
+}
+
+static void APP_ZIGBEE_mark_joined(void)
+{
+	uint32_t pers_tm = APP_ZIGBEE_PERSIST_TIMEOUT_MS;
+
+	recovery_state = APP_ZIGBEE_RECOVERY_JOINED;
+	rejoin_attempts = 0U;
+	trust_center_rejoin_attempts = 0U;
+	zigbee_app_info.join_status = ZB_STATUS_SUCCESS;
+	zigbee_app_info.join_delay = 0U;
+	zigbee_app_info.init_after_join = true;
+	set_default_attr_values();
+	(void)ZbPersistNotifyRegister(zigbee_app_info.zb, APP_ZIGBEE_persist_notify_cb, NULL);
+	(void)ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_PersistTimeoutMs,
+			&pers_tm, sizeof(pers_tm), 0);
+	ZbZclAttrReportKick(multistate_cluster, true, NULL, NULL);
+}
+
+static void APP_ZIGBEE_CoordinatorProbeCompleted_callback(
+		struct ZbZdoNodeDescRspT *rsp, void *arg)
+{
+	UNUSED(arg);
+	APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_PROBE_COMPLETE,
+			(uint32_t)rsp->status, rsp->nwkAddr);
+
+	/* A network event may already have started recovery while this ZDO
+	 * transaction was outstanding. Do not let a late response undo it. */
+	if (recovery_state != APP_ZIGBEE_RECOVERY_PROBE_PENDING) {
+		return;
+	}
+	if (rsp->status == ZB_STATUS_SUCCESS) {
+		recovery_state = APP_ZIGBEE_RECOVERY_JOINED;
+		return;
+	}
+
+	APP_ZIGBEE_request_recovery(APP_ZIGBEE_DIAG_PROBE_COMPLETE);
+}
+
+static void APP_ZIGBEE_start_coordinator_probe(void)
+{
+	struct ZbZdoNodeDescReqT req = {
+		.dstNwkAddr = ZB_NWK_ADDR_COORDINATOR,
+		.nwkAddrOfInterest = ZB_NWK_ADDR_COORDINATOR,
+	};
+	enum ZbStatusCodeT status;
+
+	recovery_state = APP_ZIGBEE_RECOVERY_PROBE_PENDING;
+	APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_PROBE_STARTED, 0U,
+			ZB_NWK_ADDR_COORDINATOR);
+	status = ZbZdoNodeDescReq(zigbee_app_info.zb, &req,
+			APP_ZIGBEE_CoordinatorProbeCompleted_callback, NULL);
+	if (status != ZB_STATUS_SUCCESS) {
+		APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_PROBE_COMPLETE,
+				(uint32_t)status, ZB_NWK_ADDR_COORDINATOR);
+		APP_ZIGBEE_request_recovery(APP_ZIGBEE_DIAG_PROBE_COMPLETE);
+	}
+}
+
 
 /*************************************************************
  *
  * NVM FUNCTIONS
  *
  *************************************************************/
-static void APP_ZIGBEE_pack_persist_values(struct persistence_attrs *persistence_attrs)
+static void APP_ZIGBEE_pack_persist_values(struct persistence_attrs *persistence_attrs,
+		const uint8_t *stack_data, uint32_t stack_len)
 {
-    persistence_attrs->struct_len = sizeof(struct persistence_attrs);
+	struct persistence_attrs aligned = { 0 };
+
+	aligned.struct_len = sizeof(aligned);
 
     unsigned n;
     for (n = 0; n < lengthof(analog_cluster_attrs); n++)
-    	persistence_attrs->analogValues[n] = analog_cluster_attrs[n].value;
+		aligned.analogValues[n] = analog_cluster_attrs[n].value;
 
-    persistence_attrs->multistateValue = operationMode;
+	aligned.multistateValue = operationMode;
+	aligned.crc32 = APP_ZIGBEE_persist_crc(stack_data, stack_len, &aligned);
+	memcpy(persistence_attrs, &aligned, sizeof(aligned));
 }
 
 static void APP_ZIGBEE_unpack_persist_values(struct persistence_attrs *persistence_attrs)
 {
-	if (persistence_attrs->struct_len == sizeof(struct persistence_attrs)) {
+	struct persistence_attrs aligned;
+
+	memcpy(&aligned, persistence_attrs, sizeof(aligned));
+	if (aligned.struct_len == sizeof(aligned)) {
 		unsigned n;
 		for (n = 0; n < lengthof(analog_cluster_attrs); n++)
-			analog_cluster_attrs[n].value = persistence_attrs->analogValues[n];
+			analog_cluster_attrs[n].value = aligned.analogValues[n];
 
-		operationMode = persistence_attrs->multistateValue;
+		operationMode = aligned.multistateValue;
+	}
+}
+
+static void APP_ZIGBEE_unpack_persist_values_v1(const struct persistence_attrs_v1 *persistence_attrs)
+{
+	struct persistence_attrs_v1 aligned;
+
+	memcpy(&aligned, persistence_attrs, sizeof(aligned));
+	if (aligned.struct_len == sizeof(aligned)) {
+		for (unsigned n = 0; n < lengthof(analog_cluster_attrs); n++) {
+			analog_cluster_attrs[n].value = aligned.analogValues[n];
+		}
+		operationMode = aligned.multistateValue;
 	}
 }
 
@@ -1358,18 +1838,18 @@ static void APP_ZIGBEE_PersistCompleted_callback(enum ZbStatusCodeT status,void 
    if(status == ZB_WPAN_STATUS_SUCCESS)
    {
 	   APP_DBG("Persist complete callback entered with SUCCESS");
-	   set_default_attr_values();
+	   APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_PERSIST_COMPLETE,
+			   (uint32_t)status, ZbShortAddress(zigbee_app_info.zb));
+	   APP_ZIGBEE_mark_joined();
+	   APP_ZIGBEE_start_coordinator_probe();
    }
    else
    {
 	   APP_DBG("Error in persist complete callback %x",status);
+	   APP_ZIGBEE_diag_record(APP_ZIGBEE_DIAG_PERSIST_FAILED,
+			   (uint32_t)status, 0xffffU);
+	   APP_ZIGBEE_request_recovery(APP_ZIGBEE_DIAG_PERSIST_FAILED);
    }
-   /* STEP3 - Activate back the persistent notification */
-     /* Register Persistent data change notification */
-     ZbPersistNotifyRegister(zigbee_app_info.zb,APP_ZIGBEE_persist_notify_cb,NULL);
-
-     /* Call the callback once here to save persistence data */
-     APP_ZIGBEE_persist_notify_cb(zigbee_app_info.zb,NULL);
 }/* APP_ZIGBEE_PersistCompleted_callback */
 
 
@@ -1383,18 +1863,46 @@ static bool APP_ZIGBEE_persist_load(void)
 #ifdef CFG_NVM
     APP_DBG("Retrieving persistent data from FLASH");
     bool status = APP_ZIGBEE_NVM_Read();
+	persist_record_present = status;
+	persist_record_valid = false;
 
     if (status) {
-    	unsigned len = cache_persistent_data.U32_data[0];
-    	if (len > sizeof(struct persistence_attrs))
-    	{
-    		len -= sizeof(struct persistence_attrs);
-    		cache_persistent_data.U32_data[0] = len;
-    		struct persistence_attrs *persistence_attrs = (struct persistence_attrs *)&cache_persistent_data.U8_data[ST_PERSIST_FLASH_DATA_OFFSET + len];
-    		APP_ZIGBEE_unpack_persist_values(persistence_attrs);
-    	}
+		uint32_t total_len = cache_persistent_data.U32_data[0];
+
+		if (total_len > sizeof(struct persistence_attrs)) {
+			uint32_t stack_len = total_len - sizeof(struct persistence_attrs);
+			const uint8_t *footer =
+					&cache_persistent_data.U8_data[ST_PERSIST_FLASH_DATA_OFFSET + stack_len];
+			struct persistence_attrs attrs;
+			memcpy(&attrs, footer, sizeof(attrs));
+			if ((attrs.struct_len == sizeof(attrs)) &&
+					(attrs.crc32 == APP_ZIGBEE_persist_crc(
+							&cache_persistent_data.U8_data[ST_PERSIST_FLASH_DATA_OFFSET],
+							stack_len, &attrs))) {
+				cache_persistent_data.U32_data[0] = stack_len;
+				APP_ZIGBEE_unpack_persist_values(&attrs);
+				persist_record_valid = true;
+			}
+		}
+
+		/* Accept the previous footer format once, then convert it on the next save. */
+		if (!persist_record_valid && (total_len > sizeof(struct persistence_attrs_v1))) {
+			uint32_t stack_len = total_len - sizeof(struct persistence_attrs_v1);
+			struct persistence_attrs_v1 attrs;
+			memcpy(&attrs,
+					&cache_persistent_data.U8_data[ST_PERSIST_FLASH_DATA_OFFSET + stack_len],
+					sizeof(attrs));
+			if (attrs.struct_len == sizeof(attrs)) {
+				cache_persistent_data.U32_data[0] = stack_len;
+				APP_ZIGBEE_unpack_persist_values_v1(&attrs);
+				persist_record_valid = true;
+			}
+		}
     }
-    return status;
+	if (persist_record_present && !persist_record_valid) {
+		APP_DBG("Persistent data footer or CRC is invalid");
+	}
+    return persist_record_valid;
 #else
     /* Check length range */
     if ((cache_persistent_data.U32_data[0] == 0) ||
@@ -1428,7 +1936,7 @@ static bool APP_ZIGBEE_persist_save(void)
         APP_DBG("APP_ZIGBEE_persist_save: no persistence data to save !");
         return false;
     }
-    if (len > ST_PERSIST_MAX_ALLOC_SZ - sizeof(struct persistence_attrs))
+    if (len > APP_ZIGBEE_PERSIST_CAPACITY - sizeof(struct persistence_attrs))
     {
         /* if persistence length too big to store */
         APP_DBG("APP_ZIGBEE_persist_save: persist size too large for storage (%d)", len);
@@ -1440,7 +1948,8 @@ static bool APP_ZIGBEE_persist_save(void)
 
     /* Append attribute values that need to survive restarts. ZCL persistence code is unreliable, so implement the separate storage. */
     struct persistence_attrs *persistence_attrs = (struct persistence_attrs *)&cache_persistent_data.U8_data[ST_PERSIST_FLASH_DATA_OFFSET + len];
-    APP_ZIGBEE_pack_persist_values(persistence_attrs);
+    APP_ZIGBEE_pack_persist_values(persistence_attrs,
+			&cache_persistent_data.U8_data[ST_PERSIST_FLASH_DATA_OFFSET], len);
 
     /* Store in cache the persistent data length */
     cache_persistent_data.U32_data[0] = len + sizeof(struct persistence_attrs);
@@ -1493,9 +2002,20 @@ static void APP_ZIGBEE_NVM_Init(void)
 
   if(eeprom_init_status != EE_OK)
   {
-    /* format NVM since init failed */
-    eeprom_init_status= EE_Init( 1, HW_FLASH_ADDRESS + CFG_NVM_BASE_ADDRESS );
+	/* Do not format automatically. Preserve the failed bank for field diagnosis;
+	 * an explicit leave/factory-reset operation may format it later. */
+	nvm_ready = false;
+	APP_DBG("EE recovery failed; NVM retained for diagnosis");
+	return;
   }
+	nvm_ready = true;
+	if (!APP_ZIGBEE_diag_load()) {
+		memset(&zigbee_diag, 0, sizeof(zigbee_diag));
+		zigbee_diag.magic = APP_ZIGBEE_DIAG_MAGIC;
+		zigbee_diag.version = APP_ZIGBEE_DIAG_VERSION;
+	}
+	persist_reference_valid = false;
+	persist_reference_words = 0U;
   APP_DBG("EE_init status = %d",eeprom_init_status);
 
 } /* APP_ZIGBEE_NVM_Init */
@@ -1510,6 +2030,11 @@ static bool APP_ZIGBEE_NVM_Read(void)
     uint16_t num_words = 0;
     bool status = true;
     int ee_status = 0;
+	persist_reference_valid = false;
+	persist_reference_words = 0U;
+	if (!nvm_ready) {
+		return false;
+	}
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_PGSERR | FLASH_FLAG_WRPERR | FLASH_FLAG_OPTVERR);
 
@@ -1522,7 +2047,7 @@ static bool APP_ZIGBEE_NVM_Read(void)
     }
       /* Check length is not too big nor zero */
     else if((cache_persistent_data.U32_data[0] == 0) ||
-            (cache_persistent_data.U32_data[0]> ST_PERSIST_MAX_ALLOC_SZ))
+            (cache_persistent_data.U32_data[0] > APP_ZIGBEE_PERSIST_CAPACITY))
     {
             APP_DBG("No data or too large length : %d", cache_persistent_data.U32_data[0]);
             status = false;
@@ -1561,6 +2086,14 @@ static bool APP_ZIGBEE_NVM_Read(void)
     HAL_FLASH_Lock();
     if(status)
     {
+		/* Keep an exact RAM shadow of the committed logical EEPROM image. The
+		 * persistence loader subsequently removes the application footer length
+		 * from cache_persistent_data, so take the copy before returning. */
+		memcpy(&cache_diag_reference, &cache_persistent_data,
+				 sizeof(cache_diag_reference));
+		persist_reference_words = (uint16_t)(1U +
+				((cache_persistent_data.U32_data[0] + 3U) / 4U));
+		persist_reference_valid = true;
         APP_DBG("READ PERSISTENT DATA LEN = %d",cache_persistent_data.U32_data[0]);
     }
     return status;
@@ -1577,7 +2110,12 @@ static bool APP_ZIGBEE_NVM_Write(void)
 
     uint16_t num_words;
     uint16_t local_current_size;
+	uint16_t words_written = 0U;
 
+
+	if (!nvm_ready) {
+		return false;
+	}
 
     num_words = 1U; /* 1 words for the length */
     num_words+= (uint16_t) (cache_persistent_data.U32_data[0]/4);
@@ -1589,26 +2127,37 @@ static bool APP_ZIGBEE_NVM_Write(void)
         num_words++;
     }
 
-    //save data in flash
-    for (local_current_size = 0; local_current_size < num_words; local_current_size++)
+    /* Program data before the length/commit word. Compare against the RAM
+     * shadow rather than calling EE_Read for every word: EE_Read scans the
+     * append-only pool, while a RAM comparison is constant-time. Words beyond
+     * the previous image length must be written even if the shadow happens to
+     * contain the same value, because an older stale virtual value may exist. */
+    for (local_current_size = 1U; local_current_size < num_words; local_current_size++)
     {
+		if (persist_reference_valid &&
+				(local_current_size < persist_reference_words) &&
+				(cache_diag_reference.U32_data[local_current_size] ==
+				 cache_persistent_data.U32_data[local_current_size])) {
+			continue;
+		}
         ee_status = EE_Write(0, (uint16_t)local_current_size + ZIGBEE_DB_START_ADDR, cache_persistent_data.U32_data[local_current_size]);
         if (ee_status != EE_OK)
         {
            if(ee_status == EE_CLEAN_NEEDED) /* Shall not be there if CFG_EE_AUTO_CLEAN = 1*/
            {
               APP_DBG("CLEAN NEEDED, CLEANING");
-              EE_Clean(0,0);
+			  ee_status = EE_Clean(0,0);
            }
-           else
+           if (ee_status != EE_OK)
            {
-              /* Failed to write , an Erase shall be done */
               APP_DBG("APP_ZIGBEE_NVM_Write failed @ %d status %d", local_current_size,ee_status);
               break;
            }
         }
+		cache_diag_reference.U32_data[local_current_size] =
+				cache_persistent_data.U32_data[local_current_size];
+		words_written++;
     }
-
 
     if(ee_status != EE_OK)
     {
@@ -1616,7 +2165,28 @@ static bool APP_ZIGBEE_NVM_Write(void)
        return false;
     }
 
-    APP_DBG("WRITTEN PERSISTENT DATA LEN = %d",cache_persistent_data.U32_data[0]);
+	/* Length is the commit word and is deliberately written last. */
+	if (!persist_reference_valid ||
+			(cache_diag_reference.U32_data[0] != cache_persistent_data.U32_data[0])) {
+		ee_status = EE_Write(0, ZIGBEE_DB_START_ADDR,
+				cache_persistent_data.U32_data[0]);
+		if (ee_status == EE_CLEAN_NEEDED) {
+			ee_status = EE_Clean(0, 0);
+		}
+		if (ee_status != EE_OK) {
+			APP_DBG("APP_ZIGBEE_NVM_Write failed @ length status %d", ee_status);
+			return false;
+		}
+		cache_diag_reference.U32_data[0] = cache_persistent_data.U32_data[0];
+		words_written++;
+	}
+
+	persist_reference_words = num_words;
+	persist_reference_valid = true;
+	persistNumWordsWritten += words_written;
+
+    APP_DBG("WRITTEN PERSISTENT DATA LEN = %d, changed words = %d, total words = %u",
+			cache_persistent_data.U32_data[0], words_written, persistNumWordsWritten);
     return true;
 
 } /* APP_ZIGBEE_NVM_Write */
@@ -1628,7 +2198,13 @@ static bool APP_ZIGBEE_NVM_Write(void)
  */
 static void APP_ZIGBEE_NVM_Erase(void)
 {
-   EE_Init(1, HW_FLASH_ADDRESS + CFG_NVM_BASE_ADDRESS); /* Erase Flash */
+   nvm_ready = (EE_Init(1, HW_FLASH_ADDRESS + CFG_NVM_BASE_ADDRESS) == EE_OK); /* Erase Flash */
+	persist_reference_valid = false;
+	persist_reference_words = 0U;
+	memset(&zigbee_diag, 0, sizeof(zigbee_diag));
+	zigbee_diag.magic = APP_ZIGBEE_DIAG_MAGIC;
+	zigbee_diag.version = APP_ZIGBEE_DIAG_VERSION;
+	diag_dirty = nvm_ready;
 } /* APP_ZIGBEE_NVM_Erase */
 
 #endif /* CFG_NVM */

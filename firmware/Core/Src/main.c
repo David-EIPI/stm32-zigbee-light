@@ -50,6 +50,10 @@
 #define DEFAULT_AMBIENT_THRESHOLD 50
 #define DEFAULT_DIM_LEVEL 50
 
+/* Optional last-resort periodic reset. Prefer the Zigbee recovery state machine
+ * and watchdog; keep this disabled unless field experience shows it is useful. */
+#define CFG_DAILY_RESTART 0
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -354,7 +358,11 @@ void seq_main_loop(void)
 /* Setup daily restart */
 void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc)
 {
+#if CFG_DAILY_RESTART
 	HAL_NVIC_SystemReset();
+#else
+	UNUSED(hrtc);
+#endif
 }
 
 #if CFG_DEBUG_TRACE
@@ -871,6 +879,30 @@ static void MX_RTC_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN RTC_Init 2 */
+#if CFG_DAILY_RESTART
+  /* CubeMX's generated alarm above is polling-only and masks the time fields.
+   * Replace it with a daily 23:59:59 interrupt alarm. */
+  (void)HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+  memset(&sAlarm, 0, sizeof(sAlarm));
+  sAlarm.AlarmTime.Hours = 0x23;
+  sAlarm.AlarmTime.Minutes = 0x59;
+  sAlarm.AlarmTime.Seconds = 0x59;
+  sAlarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sAlarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  sAlarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY;
+  sAlarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
+  sAlarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+  sAlarm.AlarmDateWeekDay = 0x1;
+  sAlarm.Alarm = RTC_ALARM_A;
+  HAL_NVIC_SetPriority(RTC_Alarm_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(RTC_Alarm_IRQn);
+  if (HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+#else
+  (void)HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+#endif
 
   /* USER CODE END RTC_Init 2 */
 
@@ -1243,6 +1275,13 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+#if CFG_DAILY_RESTART
+void RTC_Alarm_IRQHandler(void)
+{
+	HAL_RTC_AlarmIRQHandler(&hrtc);
+}
+#endif
 
 /* USER CODE END 4 */
 
