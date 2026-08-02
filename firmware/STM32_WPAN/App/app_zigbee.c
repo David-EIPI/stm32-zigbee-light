@@ -393,7 +393,7 @@ static void APP_ZIGBEE_StackLayersInit(void)
   res = ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
   if (ZB_STATUS_SUCCESS == res) {
 	  bdb_flags |= ZB_BDB_FLAG_IGNORE_COST_DURING_JOIN;
-	  ZbBdbGetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
+	  ZbBdbSetIndex(zigbee_app_info.zb, ZB_BDB_Flags, &bdb_flags, sizeof(bdb_flags), 0);
   }
 
 
